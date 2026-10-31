@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import * as http from "node:http";
 import test from "node:test";
+import { readFile } from "node:fs/promises";
+import { relayLogPath } from "../src/relay-log.ts";
 import { TurnRelay } from "../src/turn-relay.ts";
 
 function listen(server: http.Server): Promise<number> {
@@ -21,7 +23,8 @@ test("relays one upstream Messages request and captures its SSE response", async
     for await (const chunk of request) body += chunk;
     upstreamBodies.push(body);
     upstreamBetas.push(String(request.headers["anthropic-beta"] ?? ""));
-    response.writeHead(200, { "content-type": "text/event-stream", "request-id": "req_test" });
+    response.writeHead(200, { "content-type": "text/event-stream", "request-id": "req_test",
+      ...(upstreamBodies.length === 1 ? { "retry-after": "120" } : {}) });
     const usage = {
       input_tokens: 2,
       output_tokens: 1,
@@ -71,11 +74,13 @@ test("relays one upstream Messages request and captures its SSE response", async
     assert.equal(relay.capture.message?.content[0]?.type, "text");
     assert.equal((relay.capture.message?.content[0] as { text: string }).text, "hello");
     assert.equal(relay.requestId, "req_test");
+    assert.equal(typeof relay.rateLimit?.retryAfterAt, "number");
     assert.deepEqual(observed.at(-1), "message_stop");
 
     relay.finishTurn();
     const nextObserved: string[] = [];
     relay.beginTurn((event) => nextObserved.push(event.type));
+    assert.equal(relay.rateLimit, undefined);
     const next = await fetch(`${baseUrl}/v1/messages`, { method: "POST", body: '{"turn":2}' });
     assert.equal(next.status, 200);
     await next.text();
@@ -85,9 +90,47 @@ test("relays one upstream Messages request and captures its SSE response", async
     assert.equal(relay.denied, 0);
     assert.equal(relay.capture.complete, true);
     assert.equal(nextObserved.at(-1), "message_stop");
+    const records = (await readFile(relayLogPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const record = records.findLast((item) => item.upstream === `http://127.0.0.1:${upstreamPort}`);
+    assert.equal(record.cache.comparison, "no-baseline");
+    assert.equal(record.cache.usage.input, 2);
+    assert.equal(record.cache.usage.output, 1);
+    assert.equal(record.cache.usage.readShare, 0);
+    assert.equal(record.continuation, false);
+    assert.equal(typeof record.worker, "string");
   } finally {
     await relay.close();
     await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+});
+
+test("logs a failed upstream connection without request credentials or body", async () => {
+  const closed = http.createServer();
+  const port = await listen(closed);
+  await new Promise<void>((resolve) => closed.close(() => resolve()));
+  const relay = new TurnRelay(`http://127.0.0.1:${port}`, 1_000);
+  try {
+    const baseUrl = await relay.start();
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: "POST",
+      headers: { authorization: "Bearer private-token" },
+      body: "private-conversation",
+    });
+    assert.equal(response.status, 502);
+    await response.text();
+    await relay.settled();
+    assert.ok(relay.failure?.includes(relayLogPath));
+    const raw = await readFile(relayLogPath, "utf8");
+    assert.ok(!raw.includes("private-token"));
+    assert.ok(!raw.includes("private-conversation"));
+    const record = raw.trim().split("\n").map((line) => JSON.parse(line))
+      .findLast((item) => item.upstream === `http://127.0.0.1:${port}`);
+    assert.equal(record.error.code, "ECONNREFUSED");
+    assert.equal(record.error.port, port);
+    assert.equal(record.captureComplete, false);
+    assert.ok(record.network.some((item: { event: string }) => item.event === "socket"));
+  } finally {
+    await relay.close();
   }
 });
 

@@ -2,6 +2,7 @@ import { createProvider, type AuthContext, type ProviderEnv } from "@earendil-wo
 import { discoverClaudeModels, getClaudeStatus, LOGIN_HINT } from "./claude-cli.ts";
 import { API_ID, CLAUDE_CODE_MODELS, modelFromDiscovery, PROVIDER_ID } from "./model-catalog.ts";
 import { streamClaudeCode } from "./stream.ts";
+import { UsageLimitController } from "./usage-limits.ts";
 
 const PROVIDER_ENV_NAMES = ["PI_CLAUDE_CODE_COMMAND", "PI_CLAUDE_CODE_CONFIG_DIR", "CLAUDE_CONFIG_DIR"] as const;
 
@@ -26,7 +27,7 @@ export function claudeCodeEnv(): Record<string, string | undefined> {
   return { ...process.env, ...lastProviderEnv };
 }
 
-export function createClaudeCodeProvider() {
+export function createClaudeCodeProvider(usageLimits = new UsageLimitController()) {
   let discoveredIds: Set<string> | undefined;
   const externalOAuthMarker = () => ({
     type: "oauth" as const,
@@ -100,8 +101,8 @@ export function createClaudeCodeProvider() {
       return ids ? models.filter((model) => ids.has(model.id)) : models;
     },
     api: {
-      stream: streamClaudeCode,
-      streamSimple: streamClaudeCode,
+      stream: (model, context, options) => streamClaudeCode(model, context, options, usageLimits),
+      streamSimple: (model, context, options) => streamClaudeCode(model, context, options, usageLimits),
     },
   });
 }

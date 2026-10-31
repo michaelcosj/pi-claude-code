@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { AssistantMessage, Message, Tool } from "@earendil-works/pi-ai";
+import { CLAUDE_CODE_MODELS } from "../src/model-catalog.ts";
 import {
   buildExtraBody,
   getInitialSystemMessages,
@@ -112,6 +113,68 @@ test("replays native signed blocks only while the visible projection is unchange
     { role: "user", content: "again", timestamp: 2 },
   ]);
   assert.deepEqual(edited[1]?.message.content, [{ type: "text", text: "edited" }]);
+});
+
+test("normalizes GPT tool IDs and foreign thinking for Claude without editing the transcript", () => {
+  const model = CLAUDE_CODE_MODELS[0]!;
+  const id = "call_example|ctc_" + "a".repeat(70);
+  const assistant: AssistantMessage = {
+    role: "assistant", api: "openai-responses", provider: "openai", model: "gpt-6.1-sol",
+    content: [
+      { type: "thinking", thinking: "Planning", thinkingSignature: "openai-signature" },
+      { type: "thinking", thinking: "", thinkingSignature: "encrypted" },
+      { type: "thinking", thinking: "redacted", thinkingSignature: "opaque", redacted: true },
+      { type: "toolCall", id, name: "read", arguments: { id } },
+    ],
+    usage, stopReason: "toolUse", timestamp: 1,
+  };
+  const messages: Message[] = [
+    { role: "user", content: "inspect", timestamp: 0 }, assistant,
+    { role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text: "done" }], isError: false, timestamp: 2 },
+    { role: "user", content: "continue", timestamp: 3 },
+  ];
+  const original = structuredClone(messages);
+  const frames = prepareFrames(messages, model);
+  const content = frames[1]!.message.content as Array<Record<string, unknown>>;
+  assert.deepEqual(content[0], { type: "text", text: "Planning" });
+  assert.equal(content.length, 2);
+  const tool = content[1]!;
+  assert.match(tool.id as string, /^[a-zA-Z0-9_-]{1,64}$/);
+  assert.equal(tool.id, id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64));
+  assert.deepEqual(tool.input, { id });
+  assert.equal((frames[2]!.message.content[0] as { tool_use_id: string }).tool_use_id, tool.id);
+  assert.deepEqual(messages, original);
+  assert.deepEqual(prepareFrames(messages, model), frames);
+});
+
+test("keeps same-model signed replay intact but never restores a foreign native carrier", () => {
+  const model = CLAUDE_CODE_MODELS[0]!;
+  const assistant: AssistantMessage = {
+    role: "assistant", api: model.api, provider: model.provider, model: model.id,
+    content: [
+      { type: "thinking", thinking: "redacted", thinkingSignature: "signed", redacted: true },
+      { type: "toolCall", id: "toolu_native", name: "read", arguments: {} },
+    ],
+    usage, stopReason: "toolUse", timestamp: 1,
+  };
+  const native = {
+    id: "m1", role: "assistant" as const,
+    content: [
+      { type: "redacted_thinking" as const, data: "signed" },
+      { type: "tool_use" as const, id: "toolu_native", name: `${TOOL_PREFIX}read`, input: {} },
+    ],
+    stop_reason: "tool_use",
+  };
+  assistant.diagnostics = [makeReplayDiagnostic(native, assistant) as never];
+  const messages: Message[] = [
+    { role: "user", content: "inspect", timestamp: 0 }, assistant,
+    { role: "toolResult", toolCallId: "toolu_native", toolName: "read", content: [{ type: "text", text: "done" }], isError: false, timestamp: 2 },
+  ];
+  assert.deepEqual(prepareFrames(messages, model)[1]!.message.content, native.content);
+  const original = structuredClone(messages);
+  const switched = prepareFrames(messages, { ...model, id: "another-model" });
+  assert.deepEqual(switched[1]!.message.content, [native.content[1]]);
+  assert.deepEqual(messages, original);
 });
 
 test("builds cache-stable native tool declarations and chronological system changes", () => {

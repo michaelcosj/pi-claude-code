@@ -8,7 +8,8 @@ import { createInterface } from "node:readline";
 import { spawn, type ChildProcess } from "node:child_process";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { TurnRelay } from "./turn-relay.ts";
-import { usageCreditsAllowed, usageCreditsChargeError, type RateLimitInfo } from "./billing.ts";
+import { describeUsageCreditsRejection, usageCreditsAllowed, usageCreditsChargeError, type RateLimitInfo } from "./billing.ts";
+import { ClaudeRateLimitError, mergeRateLimitInfo } from "./usage-limits.ts";
 import { envFlagEnabled } from "./env.ts";
 import type { DiscoveredClaudeModel } from "./model-catalog.ts";
 import type {
@@ -59,6 +60,8 @@ export interface RunClaudeInput {
   /** Beta features appended to Claude Code's own request header by the turn relay. */
   betas?: string[];
   onEvent?: (event: AnthropicStreamEvent) => void;
+  /** Inspect or replace the final Messages payload before the relay sends it. */
+  onPayload?: (payload: unknown) => unknown | undefined | Promise<unknown | undefined>;
   /** Pi session whose linear continuation may reuse a warm Claude process. */
   sessionId?: string;
 }
@@ -900,17 +903,24 @@ class ClaudeProcess {
     const canonicalInitialUser = input.frames.find((frame) => frame.type === "user")?.message.content ?? [];
     this.relay.beginTurn(
       deliver,
-      input.initialUserPrefix || input.initialSystemMessages || input.nativeSystemInjections
-        ? (body) =>
-            rewriteInitialRequest(
-              body,
-              input.initialUserPrefix,
-              canonicalInitialUser,
-              input.initialSystemMessages,
-              input.nativeSystemInjections,
-            )
-        : undefined,
+      async (body) => {
+        if (input.initialUserPrefix || input.initialSystemMessages || input.nativeSystemInjections) {
+          body = rewriteInitialRequest(
+            body,
+            input.initialUserPrefix,
+            canonicalInitialUser,
+            input.initialSystemMessages,
+            input.nativeSystemInjections,
+          );
+        }
+        if (!input.onPayload) return body;
+        const payload: unknown = JSON.parse(body.toString("utf8"));
+        const replacement = await input.onPayload(payload);
+        return Buffer.from(JSON.stringify(replacement ?? payload));
+      },
       input.betas,
+      input.sessionId,
+      continuation,
     );
 
     const abort = () => {
@@ -959,6 +969,7 @@ class ClaudeProcess {
       }
       await this.relay.settled();
       input.signal?.throwIfAborted();
+      rateLimit = mergeRateLimitInfo(rateLimit, this.relay.rateLimit);
 
       let message: NativeMessage | undefined;
       if (this.relay.used) {
@@ -967,6 +978,9 @@ class ClaudeProcess {
           if (this.relay.failure) detail += `, relay failure ${this.relay.failure}`;
           if (this.relay.denied) detail += `, native retries denied ${this.relay.denied}`;
           const upstreamError = this.relay.errorText();
+          if (this.relay.status === 429 && !describeUsageCreditsRejection(upstreamError)) {
+            throw new ClaudeRateLimitError(upstreamError || "Account rate limit exceeded", rateLimit);
+          }
           if (upstreamError) detail += `, upstream said: ${upstreamError.slice(0, 500)}`;
           throw new Error(`Incomplete Claude Code upstream response (${detail})`);
         }
@@ -1096,7 +1110,11 @@ async function discardProcess(acquired: AcquiredProcess): Promise<void> {
 
 async function acquireProcess(input: RunClaudeInput, plan: ClaudeLaunchPlan): Promise<AcquiredProcess> {
   return withManagerLock(async () => {
-    const sessionId = input.sessionId;
+    // Local cache-miss experiment: use full-history replay by default, without
+    // changing Anthropic prompt caching. Set the flag to "0" to restore reuse.
+    const disableReuse =
+      (input.env?.PI_CLAUDE_CODE_DISABLE_PROCESS_REUSE ?? process.env.PI_CLAUDE_CODE_DISABLE_PROCESS_REUSE) !== "0";
+    const sessionId = disableReuse ? undefined : input.sessionId;
     const cached = sessionId ? processCache.get(sessionId) : undefined;
     if (cached && !cached.busy) {
       cached.clearExpiryTimer();

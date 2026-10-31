@@ -18,6 +18,7 @@ test("loads an installed extension without local peer dependencies", async (t) =
   assert.deepEqual(result.errors, []);
   assert.equal(result.extensions.length, 1);
   assert.equal(result.extensions[0].commands.has("claude-code-status"), true);
+  assert.equal(result.extensions[0].commands.has("claude-code-auto-resume"), true);
   const registrations = result.runtime.pendingNativeProviderRegistrations;
   assert.equal(registrations.length, 1);
   assert.equal(registrations[0].provider.id, "claude-code");

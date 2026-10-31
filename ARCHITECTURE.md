@@ -43,6 +43,28 @@ ask for usage credits (for example third-party app classification) are
 rewritten into the same kind of error. The latest rate-limit status is attached
 to the assistant message as a `claude-code.rate-limit` diagnostic.
 
+## Usage-limit pauses
+
+The relay parses only allowlisted rate-limit response headers into typed reset,
+status, and utilization metadata; raw headers are not retained in diagnostics.
+HTTP 429s become a `ClaudeRateLimitError`, carrying this metadata and any CLI
+rate-limit report. Usage-credit rejections retain their separate billing guard.
+
+`UsageLimitController` wraps provider request attempts, not the tool loop. It
+reports reset time and remaining wait, falling back to a near-exhausted/rejected
+window in the latest saved usage diagnostic when necessary (labelled as an
+estimate). Errors include `billing` so Pi does not also run its short retry loop.
+A controller is scoped to the extension runtime, and its opt-in preference is
+persisted as a branch-sensitive custom session entry by the toggle command.
+
+After a rejected attempt has closed its worker, an enabled controller can wait
+until reset plus a one-second grace period, then run exactly one fresh attempt
+inside the same assistant stream. It emits no intermediate terminal error and
+cannot replay partial output or tool execution. Abort signals, disabling the
+preference, and session shutdown cancel the wait. Waits are not persisted; no
+processes, sockets, or timers start just from loading the extension. Missing,
+expired, implausibly distant resets and repeat rejections stop rather than poll.
+
 ## Process reuse
 
 Linear conversations may reuse a warm Claude Code process. Only exact linear
@@ -59,8 +81,10 @@ random, loopback-only HTTP route owned by this extension.
 The relay exists because Pi, rather than Claude Code, owns the agent loop and
 tool execution. In particular, it:
 
-- forwards exactly one Anthropic Messages request for each Pi turn and rejects
-  additional native recovery attempts. Claude Code can otherwise issue another
+- accepts exactly one native Anthropic Messages request per worker turn and rejects
+  additional native recovery attempts. The relay may retry its connection before TCP
+  connect, but never replays a POST once connected. An opted-in usage-limit retry is a fresh
+  worker attempt after the reset, not a native recovery request. Claude Code can otherwise issue another
   generation after an inert MCP tool call, even with one turn and HTTP retries
   disabled;
 - captures and streams the first upstream response before Claude Code processes
@@ -76,6 +100,33 @@ tool execution. In particular, it:
   header; and
 - ties cancellation to the active upstream socket as well as the Claude Code
   process.
+
+After replay transformations, the relay calls Pi's `onPayload` hook on the final
+Messages payload. Hooks may inspect or replace the payload asynchronously, or
+throw to prevent the upstream request. This lets cached-compaction extensions
+capture and verify the actual prompt prefix using Pi's normal payload path.
+
+### Pre-connect retries
+
+`upstream-connection.ts` owns connection establishment, not generation replay.
+It applies a per-request 2-second address-attempt timeout with IPv4/IPv6 fallback,
+a 10-second TCP-connect deadline (including DNS), and at most two retries with
+500–750 ms / 1000–1250 ms backoff. An absolute response-header deadline is shared
+across attempts. Socket inactivity timeouts destroy the request rather than just
+emitting an advisory event.
+
+Only allowlisted transient error codes qualify; every nested aggregate leaf must
+qualify. The TCP `connect` event closes the retry window. Reused or already
+connected sockets start outside that window, including failures before headers.
+TLS failures, HTTP status errors and response-body failures do not enter this
+retry loop. The transformed body and headers are reused without invoking payload
+hooks again, and no intermediate error reaches Pi's outer retry machinery.
+
+A turn-scoped abort controller plus client-disconnect signal cancels both active
+requests and backoff. Failed attempts destroy their requests and release socket
+listeners and timers before waiting. Successful response sockets are still
+abortable while streaming. Turn diagnostics record attempt numbers, sanitized
+errors, delays and the final outcome without raw request/response content.
 
 ## Tool schemas
 

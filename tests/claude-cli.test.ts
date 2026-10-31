@@ -280,6 +280,7 @@ for await (const line of input) {
         EXPECTED_CWD: workingRoot,
         EXPECTED_SYSTEM_PROMPT: "system",
         PROCESS_LOG: processLog,
+        PI_CLAUDE_CODE_DISABLE_PROCESS_REUSE: "0",
       },
       timeoutMs: 5_000,
     };
@@ -378,6 +379,31 @@ for await (const line of input) {
     });
     assert.equal(afterTool.message.id, "m_fake");
     assert.equal((await readFile(processLog, "utf8")).trim().split("\n").length, 6);
+
+    await closeClaudeProcesses();
+    // Replay mode must neither reuse nor retain a worker, even for an exact
+    // linear continuation after an end_turn response.
+    const replayCommon = {
+      ...common,
+      env: { ...common.env, PI_CLAUDE_CODE_DISABLE_PROCESS_REUSE: "1" },
+    };
+    const replayFirst = await runClaudeRequest({
+      ...replayCommon,
+      sessionId: "replay-session",
+      frames: [{ type: "user", message: { role: "user", content: [{ type: "text", text: "one" }] } }],
+    });
+    const replaySecond = await runClaudeRequest({
+      ...replayCommon,
+      sessionId: "replay-session",
+      frames: [
+        { type: "user", message: { role: "user", content: [{ type: "text", text: "one" }] }, shouldQuery: false },
+        { type: "assistant", message: { role: "assistant", content: replayFirst.message.content } },
+        { type: "user", message: { role: "user", content: [{ type: "text", text: "two" }] } },
+      ],
+    });
+    assert.equal(replaySecond.message.id, "m_fake");
+    assert.equal((await readFile(processLog, "utf8")).trim().split("\n").length, 8);
+    assert.equal(cachedClaudeProcessCount(), 0);
   } finally {
     await closeClaudeProcesses();
     await rm(root, { recursive: true, force: true });

@@ -1,7 +1,11 @@
 import * as http from "node:http";
-import * as https from "node:https";
 import { randomBytes } from "node:crypto";
 import type { AddressInfo } from "node:net";
+import { appendRelayLog, relayLogPath, transportError } from "./relay-log.ts";
+import { cacheDiagnostics } from "./cache-diagnostics.ts";
+import { readRateLimitHeaders } from "./usage-limits.ts";
+import { connectUpstream } from "./upstream-connection.ts";
+import type { RateLimitInfo } from "./billing.ts";
 import type { AnthropicStreamEvent, NativeContentBlock, NativeMessage } from "./native-types.ts";
 
 function copy<T>(value: T): T {
@@ -117,6 +121,7 @@ export class TurnRelay {
   denied = 0;
   status?: number;
   requestId?: string;
+  rateLimit?: RateLimitInfo;
   failure?: string;
   errorBody = Buffer.alloc(0);
   originalRequestBody?: Buffer;
@@ -128,16 +133,20 @@ export class TurnRelay {
   private readonly sockets = new Set<Destroyable>();
   private readonly active = new Set<Promise<void>>();
   private cancelled = false;
+  private turnAbort = new AbortController();
   private closed = false;
   private baseUrl?: string;
-  private transformRequest?: (body: Buffer) => Buffer;
+  private transformRequest?: (body: Buffer) => Buffer | Promise<Buffer>;
   private requestBetas: string[] = [];
+  private diagnosticSessionId?: string;
+  private diagnosticContinuation = false;
+  private readonly diagnosticWorker = randomBytes(8).toString("hex");
 
   constructor(
     upstream = "https://api.anthropic.com",
     private readonly timeoutMs = 180_000,
     onEvent?: (event: AnthropicStreamEvent) => void,
-    transformRequest?: (body: Buffer) => Buffer,
+    transformRequest?: (body: Buffer) => Buffer | Promise<Buffer>,
     requestBetas: string[] = [],
   ) {
     this.upstream = new URL(upstream);
@@ -163,8 +172,10 @@ export class TurnRelay {
   /** Arm the persistent relay for one new Claude turn. */
   beginTurn(
     onEvent?: (event: AnthropicStreamEvent) => void,
-    transformRequest?: (body: Buffer) => Buffer,
+    transformRequest?: (body: Buffer) => Buffer | Promise<Buffer>,
     requestBetas: string[] = [],
+    diagnosticSessionId?: string,
+    diagnosticContinuation = false,
   ): void {
     if (this.closed) throw new Error("Claude Code turn relay is closed");
     if (this.active.size > 0) throw new Error("Claude Code turn relay still has an active request");
@@ -173,19 +184,24 @@ export class TurnRelay {
     this.denied = 0;
     this.status = undefined;
     this.requestId = undefined;
+    this.rateLimit = undefined;
     this.failure = undefined;
     this.errorBody = Buffer.alloc(0);
     this.originalRequestBody = undefined;
     this.requestBody = undefined;
+    this.diagnosticSessionId = diagnosticSessionId;
+    this.diagnosticContinuation = diagnosticContinuation;
     this.transformRequest = transformRequest;
     this.requestBetas = requestBetas;
     this.cancelled = false;
+    this.turnAbort = new AbortController();
   }
 
   /** Disarm the current turn without closing the worker-scoped HTTP server. */
   finishTurn(): void {
     if (this.cancelled) return;
     this.cancelled = true;
+    this.turnAbort.abort();
     for (const socket of this.sockets) socket.destroy(new Error("Claude Code request aborted"));
     this.sockets.clear();
     this.server.closeAllConnections?.();
@@ -256,13 +272,34 @@ export class TurnRelay {
     this.sockets.add(request);
     this.sockets.add(response);
 
+    const started = Date.now();
+    const network: Record<string, unknown>[] = [];
+    const note = (event: string, details: Record<string, unknown> = {}) => {
+      if (network.length < 64) network.push({ event, elapsedMs: Date.now() - started, ...details });
+    };
+    const disconnected = new AbortController();
+    const onDisconnect = () => {
+      if (!response.writableFinished) disconnected.abort();
+    };
+    request.once("aborted", onDisconnect);
+    response.once("close", onDisconnect);
+    const signal = AbortSignal.any([this.turnAbort.signal, disconnected.signal]);
+    let connectionAttempts = 0;
+    let failureDetails: Record<string, unknown> | undefined;
+    let responseBytes = 0;
+    let diagnostics: ReturnType<typeof cacheDiagnostics> | undefined;
     let upstreamRequest: http.ClientRequest | undefined;
     try {
       let body = await this.readBody(request);
       this.originalRequestBody = Buffer.from(body);
-      if (this.transformRequest) body = this.transformRequest(body);
+      if (this.transformRequest) body = await this.transformRequest(body);
       this.requestBody = Buffer.from(body);
       if (this.cancelled) return;
+      try {
+        diagnostics = cacheDiagnostics(body, this.diagnosticSessionId, started);
+      } catch {
+        // Diagnostics must not affect model requests.
+      }
 
       const headers: http.OutgoingHttpHeaders = {};
       for (const [name, value] of Object.entries(request.headers)) {
@@ -283,8 +320,7 @@ export class TurnRelay {
       }
 
       const pathPrefix = this.upstream.pathname.replace(/\/$/u, "");
-      const transport = this.upstream.protocol === "https:" ? https : http;
-      upstreamRequest = transport.request({
+      const upstreamResponse = await connectUpstream({
         protocol: this.upstream.protocol,
         hostname: this.upstream.hostname,
         port: this.upstream.port || undefined,
@@ -292,16 +328,23 @@ export class TurnRelay {
         path: `${pathPrefix}/v1/messages${requestUrl.search}`,
         headers,
         timeout: this.timeoutMs,
-      });
-      this.sockets.add(upstreamRequest);
-
-      const upstreamResponse = await new Promise<http.IncomingMessage>((resolve, reject) => {
-        upstreamRequest!.once("response", resolve);
-        upstreamRequest!.once("error", reject);
-        upstreamRequest!.end(body);
+      }, body, {
+        signal,
+        onRequest: (current) => {
+          upstreamRequest = current;
+          this.sockets.add(current);
+          current.once("close", () => this.sockets.delete(current));
+        },
+        onNetwork: (event, details) => {
+          if (event === "requestAttempt") connectionAttempts += 1;
+          note(event, details);
+        },
       });
       this.sockets.add(upstreamResponse);
+      upstreamResponse.once("close", () => this.sockets.delete(upstreamResponse));
       this.status = upstreamResponse.statusCode;
+      this.rateLimit = readRateLimitHeaders(upstreamResponse.headers);
+      note("response", { status: this.status });
       this.requestId =
         String(upstreamResponse.headers["request-id"] ?? upstreamResponse.headers["x-request-id"] ?? "") || undefined;
 
@@ -314,6 +357,7 @@ export class TurnRelay {
 
       for await (const rawChunk of upstreamResponse) {
         const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+        responseBytes += chunk.length;
         if (this.status === 200) this.capture.feed(chunk);
         else if (this.errorBody.length < 65_536) {
           this.errorBody = Buffer.concat([this.errorBody, chunk]).subarray(0, 65_536);
@@ -323,14 +367,44 @@ export class TurnRelay {
       if (this.status === 200) this.capture.finish();
       response.end();
     } catch (error) {
-      this.failure = error instanceof Error ? error.name : "UnknownError";
-      if (!response.headersSent) response.writeHead(this.cancelled ? 499 : 502).end();
-      else response.destroy();
+      failureDetails = transportError(error);
+      const attempts = connectionAttempts > 1 ? ` after ${connectionAttempts} attempts` : "";
+      this.failure = `${error instanceof Error ? error.name : "UnknownError"}${attempts} (diagnostics: ${relayLogPath})`;
+      if (!response.destroyed) {
+        if (!response.headersSent) response.writeHead(signal.aborted ? 499 : 502).end();
+        else response.destroy();
+      }
     } finally {
       if (upstreamRequest) this.sockets.delete(upstreamRequest);
       this.sockets.delete(request);
       this.sockets.delete(response);
       upstreamRequest?.destroy();
+      request.off("aborted", onDisconnect);
+      response.off("close", onDisconnect);
+      let cache: ReturnType<NonNullable<typeof diagnostics>["finish"]> | undefined;
+      try {
+        cache = diagnostics?.finish(this.capture.message?.usage, this.status === 200 && this.capture.complete && !failureDetails);
+      } catch {
+        // Diagnostics must not affect model requests.
+      }
+      await appendRelayLog({
+        event: "turn-relay",
+        worker: this.diagnosticWorker,
+        continuation: this.diagnosticContinuation,
+        upstream: this.upstream.origin,
+        elapsedMs: Date.now() - started,
+        timeoutMs: this.timeoutMs,
+        connectionAttempts,
+        status: this.status,
+        requestId: this.requestId,
+        rateLimit: this.rateLimit,
+        captureComplete: this.capture.complete,
+        cancelled: signal.aborted,
+        responseBytes,
+        error: failureDetails,
+        network,
+        cache,
+      });
     }
   }
 

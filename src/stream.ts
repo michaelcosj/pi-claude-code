@@ -17,6 +17,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { describeUsageCreditsRejection } from "./billing.ts";
 import { runClaudeRequest } from "./claude-cli.ts";
+import { ClaudeRateLimitError, UsageLimitController } from "./usage-limits.ts";
 import { nativeModel, supportsNativeToolChanges } from "./model-catalog.ts";
 import type { AnthropicStreamEvent, NativeContentBlock, NativeMessage, NativeUsage } from "./native-types.ts";
 import {
@@ -332,6 +333,7 @@ export function streamClaudeCode(
   model: Model<any>,
   context: TranscriptContext,
   options?: SimpleStreamOptions,
+  usageLimits = new UsageLimitController(),
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
   const output: AssistantMessage = {
@@ -359,7 +361,7 @@ export function streamClaudeCode(
           : ""
         : getCurrentSystemPrompt(transcript.messages);
       const tools = getCurrentTools(transcript.messages);
-      const frames = prepareFrames(transcript.messages);
+      const frames = prepareFrames(transcript.messages, model);
       const initialUserPrefix = getInitialUserPrefix(transcript.messages);
       const initialSystemMessages = getInitialSystemMessages(transcript.messages);
       const preparedTools = prepareTools(tools);
@@ -371,7 +373,7 @@ export function streamClaudeCode(
       const translator = new EventTranslator(model, output, stream, preparedTools.names);
 
       stream.push({ type: "start", partial: output });
-      const response = await runClaudeRequest({
+      const response = await usageLimits.run(() => runClaudeRequest({
         model: nativeModel(model.id),
         cwd: process.cwd(),
         frames,
@@ -388,7 +390,8 @@ export function streamClaudeCode(
         betas: nativeTranscript ? [NATIVE_TOOL_CHANGES_BETA] : undefined,
         sessionId: options?.cacheRetention === "none" ? undefined : options?.sessionId,
         onEvent: (event) => translator.event(event),
-      });
+        onPayload: options?.onPayload ? (payload) => options.onPayload!(payload, model) : undefined,
+      }), context.messages, options?.signal);
       translator.finish(
         response.message,
         response.usage,
@@ -422,6 +425,9 @@ export function streamClaudeCode(
     } catch (error) {
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = normalizeError(error);
+      if (error instanceof ClaudeRateLimitError && error.rateLimit) {
+        output.diagnostics = [{ type: "claude-code.rate-limit", timestamp: Date.now(), details: error.rateLimit as never }];
+      }
       for (const block of output.content) {
         delete (block as Partial<IndexedBlock>).nativeIndex;
         delete (block as Partial<IndexedToolCall>).partialJson;

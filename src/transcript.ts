@@ -6,6 +6,7 @@ import {
   type AssistantMessage,
   type ImageContent,
   type Message,
+  type Model,
   type SimpleStreamOptions,
   type SystemMessage,
   type TextContent,
@@ -178,7 +179,35 @@ function assistantContent(message: AssistantMessage): NativeContentBlock[] {
   return canonicalAssistantContent(message);
 }
 
-export function prepareFrames(messages: Message[]): NativeFrame[] {
+export function prepareFrames(messages: Message[], model?: Model<any>): NativeFrame[] {
+  if (model) {
+    // Match Pi's Anthropic cross-model handling without importing private API
+    // modules (Pi's installed-extension loader only exposes the public facade).
+    const toolCallIds = new Map<string, string>();
+    messages = messages.map((message) => {
+      if (message.role === "toolResult") {
+        return { ...message, toolCallId: toolCallIds.get(message.toolCallId) ?? message.toolCallId };
+      }
+      if (message.role !== "assistant" ||
+          (message.provider === model.provider && message.api === model.api && message.model === model.id)) return message;
+      return {
+        ...message,
+        // Never restore a foreign model's signed native carrier.
+        diagnostics: message.diagnostics?.filter((item) => item.type !== NATIVE_REPLAY_DIAGNOSTIC),
+        content: message.content.flatMap((block): AssistantMessage["content"] => {
+          if (block.type === "thinking") {
+            return !block.redacted && block.thinking.trim() ? [{ type: "text", text: block.thinking }] : [];
+          }
+          if (block.type === "toolCall") {
+            const id = block.id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+            toolCallIds.set(block.id, id);
+            return [{ ...block, id }];
+          }
+          return [block];
+        }),
+      };
+    });
+  }
   const frames: NativeFrame[] = [];
 
   for (const message of messages) {

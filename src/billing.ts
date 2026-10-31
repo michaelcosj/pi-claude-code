@@ -12,6 +12,10 @@ export interface RateLimitInfo {
   status?: string;
   rateLimitType?: string;
   resetsAt?: number;
+  /** Absolute epoch seconds derived from an upstream Retry-After header. */
+  retryAfterAt?: number;
+  utilization?: number;
+  unifiedWindows?: Record<string, { resetsAt?: number; utilization?: number; status?: string }>;
   isUsingOverage?: boolean;
   overageStatus?: string;
   overageDisabledReason?: string;
