@@ -55,7 +55,7 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
   await chmod(executable, 0o755);
   const request = () => runClaudeRequest({
     model: "sonnet", frames: [{ type: "user", message: { role: "user", content: [{ type: "text", text: "hello" }] } }],
-    systemPrompt: "system", manifest: [], extraBody: {}, toolNames: new Set(),
+    systemPrompt: "system", manifest: [], extraBody: {},
     upstreamUrl: `http://127.0.0.1:${address.port}`, sessionId: "limit-fixture",
     env: { PI_CLAUDE_CODE_COMMAND: executable }, timeoutMs: 5_000,
   });

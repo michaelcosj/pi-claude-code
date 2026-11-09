@@ -3,7 +3,7 @@ import * as http from "node:http";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
 import { relayLogPath } from "../src/relay-log.ts";
-import { TurnRelay } from "../src/turn-relay.ts";
+import { describeFailure, TurnRelay } from "../src/turn-relay.ts";
 
 function listen(server: http.Server): Promise<number> {
   return new Promise((resolve) => {
@@ -119,7 +119,7 @@ test("logs a failed upstream connection without request credentials or body", as
     assert.equal(response.status, 502);
     await response.text();
     await relay.settled();
-    assert.ok(relay.failure?.includes(relayLogPath));
+    assert.ok(relay.failure?.includes("ECONNREFUSED"));
     const raw = await readFile(relayLogPath, "utf8");
     assert.ok(!raw.includes("private-token"));
     assert.ok(!raw.includes("private-conversation"));
@@ -162,4 +162,17 @@ test("surfaces an error event from an otherwise successful SSE stream", async ()
     await relay.close();
     await new Promise<void>((resolve) => upstream.close(() => resolve()));
   }
+});
+
+test("describes relay failures with their error code and nested errors", () => {
+  const refused = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:1"), { code: "ECONNREFUSED" });
+  assert.equal(describeFailure(refused), "Error: connect ECONNREFUSED 127.0.0.1:1");
+  const timeout = Object.assign(new Error("connect ETIMEDOUT 10.0.0.1:443"), { code: "ETIMEDOUT" });
+  const every = Object.assign(new AggregateError([refused, timeout]), { code: "ETIMEDOUT" });
+  assert.equal(
+    describeFailure(every),
+    "AggregateError (ETIMEDOUT) [Error: connect ECONNREFUSED 127.0.0.1:1; Error: connect ETIMEDOUT 10.0.0.1:443]",
+  );
+  assert.equal(describeFailure(Object.assign(new Error(""), { code: "ECONNRESET" })), "Error (ECONNRESET)");
+  assert.equal(describeFailure("nope"), "UnknownError");
 });

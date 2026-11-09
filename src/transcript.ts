@@ -13,7 +13,7 @@ import {
   type Tool,
   type ToolResultMessage,
 } from "@earendil-works/pi-ai";
-import { supportsAdaptiveThinking } from "./model-catalog.ts";
+import { supportsAdaptiveThinking, supportsDisabledThinking } from "./model-catalog.ts";
 import type { NativeContentBlock, NativeFrame, NativeMessage } from "./native-types.ts";
 
 export const TOOL_PREFIX = "mcp__pi__";
@@ -42,7 +42,6 @@ interface ReplayCarrier {
   version: 1;
   message: NativeMessage;
   projection: AssistantProjection;
-  initialUserPrefix?: unknown[];
   initialSystemMessages?: unknown[];
 }
 
@@ -53,6 +52,40 @@ interface AssistantProjection {
 
 function sanitizeSurrogates(text: string): string {
   return text.replace(/[\uD800-\uDFFF]/gu, "\uFFFD");
+}
+
+function nativeToolUseId(id: string): string {
+  return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+}
+
+export function prepareMessages(messages: Message[], model: Model<any>): Message[] {
+  const toolCallIds = new Map<string, string>();
+  return messages.map((message) => {
+    if (message.role === "toolResult") {
+      const id = toolCallIds.get(message.toolCallId);
+      return id && id !== message.toolCallId ? { ...message, toolCallId: id } : message;
+    }
+    if (
+      message.role !== "assistant" ||
+      (message.provider === model.provider && message.api === model.api && message.model === model.id)
+    ) {
+      return message;
+    }
+    return {
+      ...message,
+      diagnostics: message.diagnostics?.filter((item) => item.type !== NATIVE_REPLAY_DIAGNOSTIC),
+      content: message.content.flatMap((block): AssistantMessage["content"] => {
+        // Like pi-ai, drop thinking from other models: signatures only validate
+        // for their own model, and replaying it as text reads as visible reply.
+        if (block.type === "thinking") return [];
+        if (block.type === "text") return [{ type: "text", text: block.text }];
+        const id = nativeToolUseId(block.id);
+        toolCallIds.set(block.id, id);
+        const { thoughtSignature, ...toolCall } = block;
+        return [{ ...toolCall, id }];
+      }),
+    };
+  });
 }
 
 function clone<T>(value: T): T {
@@ -83,22 +116,14 @@ function replayCarrier(message: AssistantMessage): ReplayCarrier | undefined {
   return isReplayCarrier(candidate) ? candidate : undefined;
 }
 
-function replayMetadata(messages: Message[], key: "initialUserPrefix" | "initialSystemMessages"): unknown[] | undefined {
+export function getInitialSystemMessages(messages: Message[]): unknown[] | undefined {
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index];
     if (message?.role !== "assistant") continue;
-    const value = replayCarrier(message)?.[key];
+    const value = replayCarrier(message)?.initialSystemMessages;
     if (value) return clone(value);
   }
   return undefined;
-}
-
-export function getInitialUserPrefix(messages: Message[]): unknown[] | undefined {
-  return replayMetadata(messages, "initialUserPrefix");
-}
-
-export function getInitialSystemMessages(messages: Message[]): unknown[] | undefined {
-  return replayMetadata(messages, "initialSystemMessages");
 }
 
 function projectionsEqual(left: AssistantProjection, right: AssistantProjection): boolean {
@@ -179,35 +204,7 @@ function assistantContent(message: AssistantMessage): NativeContentBlock[] {
   return canonicalAssistantContent(message);
 }
 
-export function prepareFrames(messages: Message[], model?: Model<any>): NativeFrame[] {
-  if (model) {
-    // Match Pi's Anthropic cross-model handling without importing private API
-    // modules (Pi's installed-extension loader only exposes the public facade).
-    const toolCallIds = new Map<string, string>();
-    messages = messages.map((message) => {
-      if (message.role === "toolResult") {
-        return { ...message, toolCallId: toolCallIds.get(message.toolCallId) ?? message.toolCallId };
-      }
-      if (message.role !== "assistant" ||
-          (message.provider === model.provider && message.api === model.api && message.model === model.id)) return message;
-      return {
-        ...message,
-        // Never restore a foreign model's signed native carrier.
-        diagnostics: message.diagnostics?.filter((item) => item.type !== NATIVE_REPLAY_DIAGNOSTIC),
-        content: message.content.flatMap((block): AssistantMessage["content"] => {
-          if (block.type === "thinking") {
-            return !block.redacted && block.thinking.trim() ? [{ type: "text", text: block.thinking }] : [];
-          }
-          if (block.type === "toolCall") {
-            const id = block.id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
-            toolCallIds.set(block.id, id);
-            return [{ ...block, id }];
-          }
-          return [block];
-        }),
-      };
-    });
-  }
+export function prepareFrames(messages: Message[]): NativeFrame[] {
   const frames: NativeFrame[] = [];
 
   for (const message of messages) {
@@ -399,10 +396,14 @@ export function buildExtraBody(
   if (options?.maxTokens !== undefined) body.max_tokens = options.maxTokens;
 
   if (options?.reasoning) {
-    if (supportsAdaptiveThinking(modelId)) body.thinking = { type: "adaptive" };
+    if (supportsAdaptiveThinking(modelId)) body.thinking = { type: "adaptive", display: "summarized" };
     body.output_config = {
       effort: options.reasoning === "minimal" ? "low" : options.reasoning,
     };
+  } else if (!supportsDisabledThinking(modelId)) {
+    // Models such as Opus 5.5 reject `disabled`; use the lowest adaptive effort instead.
+    body.thinking = { type: "adaptive" };
+    body.output_config = { effort: "low" };
   } else {
     body.thinking = { type: "disabled" };
     // Native clear-thinking edits are invalid when thinking is disabled.
@@ -414,7 +415,6 @@ export function buildExtraBody(
 export function makeReplayDiagnostic(
   message: NativeMessage,
   output: AssistantMessage,
-  initialUserPrefix?: unknown[],
   initialSystemMessages?: unknown[],
 ) {
   return {
@@ -425,7 +425,6 @@ export function makeReplayDiagnostic(
         version: 1,
         message: clone(message),
         projection: assistantProjection(output),
-        ...(initialUserPrefix ? { initialUserPrefix: clone(initialUserPrefix) } : {}),
         ...(initialSystemMessages ? { initialSystemMessages: clone(initialSystemMessages) } : {}),
       },
     },

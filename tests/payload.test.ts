@@ -51,8 +51,6 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
     systemPrompt: "system",
     manifest: [],
     extraBody: {},
-    toolNames: new Set<string>(),
-    initialUserPrefix: [{ type: "text", text: "stable reminder" }],
     upstreamUrl: `http://127.0.0.1:${address.port}`,
     env: { PI_CLAUDE_CODE_COMMAND: executable },
     timeoutMs: 5_000,
@@ -69,7 +67,7 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
     });
     assert.deepEqual(observed, {
       model: "sonnet", max_tokens: 100,
-      messages: [{ role: "user", content: [{ type: "text", text: "stable reminder" }, { type: "text", text: "hello" }] }],
+      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
     });
     assert.deepEqual(received, [{ ...(observed as object), max_tokens: 42 }]);
 

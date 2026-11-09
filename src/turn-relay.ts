@@ -1,7 +1,7 @@
 import * as http from "node:http";
 import { randomBytes } from "node:crypto";
 import type { AddressInfo } from "node:net";
-import { appendRelayLog, relayLogPath, transportError } from "./relay-log.ts";
+import { appendRelayLog, transportError } from "./relay-log.ts";
 import { cacheDiagnostics } from "./cache-diagnostics.ts";
 import { readRateLimitHeaders } from "./usage-limits.ts";
 import { connectUpstream } from "./upstream-connection.ts";
@@ -115,6 +115,22 @@ const STRIPPED_REQUEST_HEADERS = new Set([
 
 const STRIPPED_RESPONSE_HEADERS = new Set(["connection", "transfer-encoding", "server", "date"]);
 
+/**
+ * Describe a relay failure without losing what Node puts outside `message`:
+ * connection errors carry their reason in `code`, and a connection attempt to
+ * every address of a host fails with an `AggregateError` that has no message.
+ */
+export function describeFailure(error: unknown): string {
+  if (!(error instanceof Error)) return "UnknownError";
+  let text = error.message ? `${error.name}: ${error.message}` : error.name;
+  const code = (error as { code?: unknown }).code;
+  if (typeof code === "string" && !text.includes(code)) text += ` (${code})`;
+  if (error instanceof AggregateError && error.errors.length > 0) {
+    text += ` [${error.errors.map(describeFailure).join("; ")}]`;
+  }
+  return text;
+}
+
 export class TurnRelay {
   capture: AnthropicCapture;
   used = false;
@@ -123,6 +139,8 @@ export class TurnRelay {
   requestId?: string;
   rateLimit?: RateLimitInfo;
   failure?: string;
+  /** The upstream request failed before Anthropic sent a response status. */
+  upstreamFailed = false;
   errorBody = Buffer.alloc(0);
   originalRequestBody?: Buffer;
   requestBody?: Buffer;
@@ -186,6 +204,7 @@ export class TurnRelay {
     this.requestId = undefined;
     this.rateLimit = undefined;
     this.failure = undefined;
+    this.upstreamFailed = false;
     this.errorBody = Buffer.alloc(0);
     this.originalRequestBody = undefined;
     this.requestBody = undefined;
@@ -368,10 +387,10 @@ export class TurnRelay {
       response.end();
     } catch (error) {
       failureDetails = transportError(error);
-      const attempts = connectionAttempts > 1 ? ` after ${connectionAttempts} attempts` : "";
-      this.failure = `${error instanceof Error ? error.name : "UnknownError"}${attempts} (diagnostics: ${relayLogPath})`;
+      this.failure = describeFailure(error);
+      this.upstreamFailed = upstreamRequest !== undefined && this.status === undefined && !this.cancelled;
       if (!response.destroyed) {
-        if (!response.headersSent) response.writeHead(signal.aborted ? 499 : 502).end();
+        if (!response.headersSent) response.writeHead(this.cancelled ? 499 : 502).end();
         else response.destroy();
       }
     } finally {
