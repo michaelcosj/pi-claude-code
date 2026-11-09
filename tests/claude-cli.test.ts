@@ -153,6 +153,7 @@ if (process.argv.includes("auth") && process.argv.includes("status")) {
   console.log(JSON.stringify({loggedIn: true, authMethod: "claude.ai", subscriptionType: "test"}));
   process.exit(0);
 }
+if (process.env.CLAUDE_CODE_ENTRYPOINT !== "t3-code") throw new Error("wrong Claude Code entrypoint");
 if (process.cwd() !== process.env.EXPECTED_CWD) throw new Error(\`wrong cwd: \${process.cwd()}\`);
 if (process.env.PROCESS_LOG) appendFileSync(process.env.PROCESS_LOG, \`\${process.pid}\\n\`);
 const systemIndex = process.argv.indexOf("--system-prompt-file");
@@ -164,6 +165,15 @@ let queryCount = 0;
 for await (const line of input) {
   const frame = JSON.parse(line);
   if (frame.type === "control_request" && frame.request?.subtype === "initialize") {
+    if (process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC !== undefined) {
+      throw new Error("model discovery must allow live catalog traffic");
+    }
+    if (process.env.DISABLE_TELEMETRY !== undefined) {
+      throw new Error("model discovery must allow telemetry for the live catalog");
+    }
+    if (process.env.DISABLE_ERROR_REPORTING !== "1") {
+      throw new Error("discovery must keep error reporting disabled");
+    }
     console.log(JSON.stringify({
       type: "control_response",
       response: {
@@ -184,6 +194,9 @@ for await (const line of input) {
     continue;
   }
   if (frame.type !== "user") continue;
+  for (const name of ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING"]) {
+    if (process.env[name] !== "1") throw new Error(\`normal requests must set \${name}=1\`);
+  }
   queryCount += 1;
   const requestedTool = frame.message?.content?.some?.(block => block.type === "text" && block.text === "call-tool");
   const text = queryCount === 1 ? "ok" : \`ok\${queryCount}\`;
@@ -235,7 +248,12 @@ for await (const line of input) {
     );
 
     const discovered = await discoverClaudeModels(
-      { PI_CLAUDE_CODE_COMMAND: executable, EXPECTED_CWD: process.cwd() },
+      {
+        PI_CLAUDE_CODE_COMMAND: executable,
+        EXPECTED_CWD: process.cwd(),
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+        DISABLE_TELEMETRY: "1",
+      },
       undefined,
       5_000,
     );

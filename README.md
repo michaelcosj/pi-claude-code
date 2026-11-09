@@ -220,6 +220,13 @@ billing guard remains in force.
 
 ## Switching models
 
+The provider discovers models through a separate Claude Code process. During
+this no-query discovery, it allows nonessential traffic and telemetry so Claude
+Code can load its live model catalog. Error reporting remains disabled. Normal
+model requests keep `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and
+`DISABLE_TELEMETRY=1`. Both discovery and normal requests set
+`CLAUDE_CODE_ENTRYPOINT=t3-code`.
+
 When replaying another model's messages, the provider normalizes tool-call IDs
 and matching tool-result references to Anthropic's format. Readable thinking is
 replayed as text; foreign signatures and opaque redacted thinking are not sent.

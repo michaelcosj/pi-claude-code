@@ -229,6 +229,11 @@ export async function discoverClaudeModels(
 ): Promise<DiscoveredClaudeModel[]> {
   signal?.throwIfAborted();
   const env = processEnvironment(envInput, {});
+  // Both flags disable Claude Code's live model catalog, even when a newer
+  // catalog is cached. Allow catalog traffic and telemetry only for this
+  // no-query discovery process; normal requests retain both disable flags.
+  delete env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC;
+  delete env.DISABLE_TELEMETRY;
   const command = await resolveClaudeExecutable(env);
   if (!command) throw new Error(INSTALL_HINT);
 
@@ -435,6 +440,7 @@ function processEnvironment(
   delete env.CLAUDE_CODE_EXTRA_BODY;
   Object.assign(env, {
     ENABLE_TOOL_SEARCH: "false",
+    CLAUDE_CODE_ENTRYPOINT: "t3-code",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     CLAUDE_CODE_MAX_RETRIES: "0",
     DISABLE_AUTO_COMPACT: "1",
